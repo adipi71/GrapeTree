@@ -1,10 +1,9 @@
 from __future__ import print_function
-import numpy as np, networkx as nx, argparse
+import numpy as np, dendropy as dp, networkx as nxls
 from numba import jit
-from glob import glob
-from ete3 import Tree
 from subprocess import Popen, PIPE
-import sys, os, tempfile, platform, re, tempfile, psutil, gzip
+import sys, os, tempfile, platform, re, tempfile, psutil
+import argparse
 
 base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -26,12 +25,9 @@ params = dict(method='MSTreeV2', # MSTree , NJ
               RapidNJ_Linux = os.path.join(base_dir, 'binaries', 'rapidnj'),
               RapidNJ_Darwin = os.path.join(base_dir, 'binaries', 'rapidnj-osx'),
               RapidNJ_Windows = os.path.join(base_dir, 'binaries', 'rapidnj.exe'),
-              ninja_Linux = os.path.join(base_dir, 'binaries', 'Ninja.jar'),
-              ninja_Darwin = os.path.join(base_dir, 'binaries', 'Ninja.jar'),
-              ninja_Windows = os.path.join(base_dir, 'binaries', 'Ninja.jar'),
              )
 
-@jit(nopython=True)
+@jit
 def contemporary(a,b,c, n_loci) :
     a[0], a[1] = max(min(a[0], n_loci-0.5), 0.5), max(min(a[1], n_loci-0.5), 0.5);
     b, c = max(min(b, n_loci-0.5), 0.5), max(min(c, n_loci-0.5), 0.5)
@@ -50,33 +46,20 @@ def contemporary(a,b,c, n_loci) :
 def add_args() :
     parser = argparse.ArgumentParser(description='For details, see "https://github.com/achtman-lab/GrapeTree/blob/master/README.md".\nIn brief, GrapeTree generates a NEWICK tree to the default output (screen) \nor a redirect output, e.g., a file. ', formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument('--profile', '-p', dest='fname', help='[REQUIRED] An input filename of a file containing MLST or SNP character data, OR a fasta file containing aligned sequences. \n', required=True)
-    parser.add_argument('--method', '-m', dest='tree', help='"MSTreeV2" [DEFAULT]\n"MSTree"\n"NJ": FastME V2 NJ tree\n"RapidNJ": RapidNJ for very large datasets\n"ninja": Alternative NJ algorithm for very large datasets\n"distance": allelic distance matrix in PHYLIP format.', default='MSTreeV2')
-    parser.add_argument('--matrix', '-x', dest='matrix_type', help='"symmetric": [DEFAULT: MSTree, NJ and RapidNJ] \n"asymmetric": [DEFAULT: MSTreeV2].\n"blockwise": (experimental for ordered loci) A different locus is given less penalty (defined by -b) if the previous locus is also different\n', default='symmetric')
+    parser.add_argument('--method', '-m', dest='tree', help='"MSTreeV2" [DEFAULT]\n"MSTree"\n"NJ": FastME V2 NJ tree\n"RapidNJ": RapidNJ for very large datasets\n"distance": p-distance matrix in PHYLIP format.', default='MSTreeV2')
+    parser.add_argument('--matrix', '-x', dest='matrix_type', help='"symmetric": [DEFAULT: MSTree, NJ and RapidNJ] \n"asymmetric": [DEFAULT: MSTreeV2].\n', default='symmetric')
     parser.add_argument('--recraft', '-r', dest='branch_recraft', help='Triggers local branch recrafting. [DEFAULT: MSTreeV2]. ', default=False, action="store_true")
     parser.add_argument('--missing', '-y', dest='handler', help='ONLY FOR symmetric DISTANCE MATRIX. \n0: [DEFAULT] ignore missing data in pairwise comparison. \n1: Remove column with missing data. \n2: treat data as an allele. \n3: Absolute number of allelic differences. ', default=0, type=int)
     parser.add_argument('--wgMLST', '-w', help='[EXPERIMENTAL] a better support of wgMLST schemes.', default=False, action="store_true")
     parser.add_argument('--heuristic', '-t', dest='heuristic', help='Tiebreak heuristic used only in MSTree and MSTreeV2\n"eBurst" [DEFAULT: MSTree]\n"harmonic" [DEFAULT: MSTreeV2]', default='eBurst')
     parser.add_argument('--n_proc', '-n',  dest='number_of_processes', help='Number of CPU processes in parallel use. [DEFAULT]: 5. ', type=int, default=5)
     parser.add_argument('--check', '-c', dest='checkEnv', help='Only calculate the expected time/memory requirements. ', default=False, action="store_true")
-    parser.add_argument('--block_penalty', '-b', dest='block_penalty', help='[DEFAULT: 0.01] The penalty that is given to a different locus if it is led by another difference. Only works for "-x blockwise"', default=0.01)
-    
+    parser.add_argument('--distances', '-d', dest='distances_matrix', help='Only calculate the distances matrix. ', default='')
     args = parser.parse_args()
     args.profile = args.fname
     args.method = args.tree
     args.n_proc = args.number_of_processes
     args.handle_missing = ['pair_delete', 'complete_delete', 'as_allele', 'absolute_distance'][args.handler]
-
-    if args.matrix_type == 'blockwise' :
-        if args.method == 'MSTreeV2' :
-            args.method = 'MSTree'
-        sys.stderr.write('You have chosen the "blockwise" matrix. The --recraft option will be disabled and all values in the profile will be treated as real alleles\n\n')
-        args.branch_recraft = False
-        args.handle_missing = args.block_penalty
-    if args.method == 'MSTreeV2' :
-        args.method = 'MSTree'
-        args.matrix_type = 'asymmetric'
-        args.heuristic = 'harmonic'
-        args.branch_recraft = True
     return args.__dict__
 
 def parallel_distance(callup) :
@@ -92,7 +75,7 @@ class distance_matrix(object) :
     @staticmethod
     def get_distance(func, profiles, handle_missing) :
         from multiprocessing import Pool
-        n_profile, n_allele = profiles.shape
+        n_profile = profiles.shape[0]
         n_proc = min(int(params['n_proc']), profiles.shape[0])
         np.save(params['prof_file'], profiles)
         if n_proc > 1 :
@@ -102,12 +85,7 @@ class distance_matrix(object) :
             subfiles = pool.map(parallel_distance, [[func, params['prof_file'], params['dist_subfile'], handle_missing, idx] for idx in indices])
             pool.close()
             del pool
-            
-            
-            res = np.zeros([n_profile, n_profile], dtype=np.float32)
-
-            for id, sf in zip(indices, subfiles) :
-                res[:, id[0]:id[1]] = np.load(sf)
+            res = np.hstack([ np.load(subfile) for subfile in subfiles ])
         else :
             subfiles = [parallel_distance([func, params['prof_file'], params['dist_subfile'], handle_missing, [0, n_profile]])]
             res = np.load(subfiles[0])
@@ -128,8 +106,7 @@ class distance_matrix(object) :
         presences = (profiles > 0)
         pp = np.sum(presences, 0).astype(float)
         pp = pp*(pp-1)/(presences.shape[0]*(presences.shape[0]-1))
-        
-        distances = np.zeros(shape=[profiles.shape[0], index_range[1] - index_range[0]], dtype=np.float32)
+        distances = np.zeros(shape=[profiles.shape[0], index_range[1] - index_range[0]])
 
         if handle_missing not in ('absolute_distance', ) :
             for i2, id in enumerate(np.arange(*index_range)) :
@@ -144,30 +121,13 @@ class distance_matrix(object) :
         return distances
 
     @staticmethod
-    def blockwise(profiles, handle_missing = 0.01, index_range=None) :
-        if index_range is None :
-            index_range = [0, profiles.shape[0]]
-
-        presences = (profiles > 0)
-        distances = np.zeros(shape=[profiles.shape[0], index_range[1] - index_range[0]], dtype=np.float32)     
-
-        for i2, id in enumerate(np.arange(*index_range)) :
-            profile = profiles[id]
-            diffs = np.hstack([np.zeros([profiles.shape[0], 1], dtype=int), profiles - profile, np.zeros([profiles.shape[0], 1], dtype=int)])
-            d1 = np.sum((diffs[:, 1:] != diffs[:, :-1]) & (diffs[:, 1:] != 0), 1)
-            d2 = np.sum(diffs != 0, 1) - d1
-            distances[:, i2] = (d1 + d2 * handle_missing)
-
-        return distances
-
-    @staticmethod
     def asymmetric(profiles, handle_missing = 'pair_delete', index_range=None) :
         if index_range is None :
             index_range = [0, profiles.shape[0]]
 
         presences = (profiles > 0)
-        distances = np.zeros(shape=[profiles.shape[0], index_range[1] - index_range[0]], dtype=np.float32)
-        
+        distances = np.zeros(shape=[profiles.shape[0], index_range[1] - index_range[0]])
+
         if handle_missing not in ('absolute_distance', ) :
             for i2, id in enumerate(np.arange(*index_range)) :
                 profile, presence = profiles[id], presences[id]
@@ -191,21 +151,18 @@ class distance_matrix(object) :
             presences = (profiles > 0)
         else :
             presences = np.repeat(np.sum(profiles >0, 0) >= profiles.shape[0], profiles.shape[0]).reshape([profiles.shape[1], profiles.shape[0]]).T
-        distances = np.zeros(shape=[profiles.shape[0], index_range[1] - index_range[0]], dtype=np.float32)
-        
+
+        distances = np.zeros(shape=[profiles.shape[0], index_range[1] - index_range[0]])
         if handle_missing in ('pair_delete',) :
             for i2, id in enumerate(np.arange(*index_range)) :
                 profile, presence = profiles[id], presences[id]
                 comparable = (presences[:id] * presence)
-                diffs = (np.sum((profiles[:id] != profile) & comparable, axis=1)+0.01) * float(presence.size) / (np.sum(comparable, axis=1)+0.01)
-                
+                diffs = np.sum((profiles[:id] != profile) & comparable, axis=1) * float(presence.size) / np.sum(comparable, axis=1)
                 distances[:id, i2] = diffs
-                distances[id, :i2] = diffs[index_range[0]:index_range[0]+id]
         else :
             for i2, id in enumerate(np.arange(*index_range)) :
                 profile, presence = profiles[id], presences[id]
                 diffs = np.sum((profiles[:id] != profile) & (presences[:id] * presence), axis=1)
-                
                 distances[:id, i2] = diffs
                 distances[id, :i2] = diffs[index_range[0]:index_range[0]+id]
         return distances
@@ -242,10 +199,6 @@ class distance_matrix(object) :
 
 class methods(object) :
     @staticmethod
-    def _blockwise(dist, weight, **params) :
-        x = methods._symmetric(dist*10000., weight, **params)
-        return [[b[0], b[1], b[2]/10000.] for b in x]
-    @staticmethod
     def _symmetric(dist, weight, **params) :
         def minimum_spanning_tree(dist) :
             n_node = dist.shape[0]
@@ -273,47 +226,68 @@ class methods(object) :
         try:
             g = nx.Graph(dist)
             ms = nx.minimum_spanning_tree(g)
-            dist = dist.astype(np.uint32)
+            dist = np.round(dist, 0)
             return [[d[0], d[1], int(d[2]['weight'])] for d in ms.edges(data=True)]
         except :
             res = minimum_spanning_tree(dist)
-            dist = dist.astype(np.uint32)
+            dist = np.round(dist, 0)
             return res
 
     @staticmethod
     def _asymmetric(dist, weight, **params) :
-        def get_shortcut(dist, weight, cutoff=20) :
-            if dist.shape[0] < 3000 :
-                cutoff = 2
-            elif dist.shape[0] < 10000 :
-                cutoff = 5
-            elif dist.shape[0] < 30000 :
-                cutoff = 10
+        def get_shortcut(dist, weight, cutoff=5) :
+            if dist.shape[0] < 10000 :
+                cutoff = 1
             link = np.array(np.where(dist < (cutoff+1) ))
             link = link.T[weight[link[0]] < weight[link[1]]].T
-            link = np.vstack([link, dist[tuple(link.tolist())] + weight[link[0]]])
+            link = np.vstack([link, dist[link.tolist()] + weight[link[0]]])
             link = link.T[np.lexsort(link)]
             return link[np.unique(link.T[1], return_index=True)[1]].astype(int)
 
-        try:
-            presence = np.arange(weight.shape[0])
-            shortcuts = get_shortcut(dist, weight)
-            for (s, t, d) in shortcuts :
-                dist[s, dist[s] > dist[t]] = dist[t, dist[s] > dist[t]]
-            presence[shortcuts.T[1]] = -1
-            dist = dist.T[presence >= 0].T[presence >= 0]
-            presence = presence[presence >=0]
-            weight2 = weight[presence]
-            dist = np.round(dist, 0) + weight2.reshape([weight2.size, -1])
-            np.fill_diagonal(dist, 0.0)
+        if(params['distances_matrix'] != ''):
+            import numpy as np
+            import pandas as pd
+            mat = np.matrix(dist)
+            df = pd.DataFrame(data=mat.astype(float))
+            df.to_csv(params['distances_matrix'], sep='\t', header=True, float_format='%.0f', index=False) 
+            sys.exit(0)
 
-            dist_file = params['tempfix'] + '.dist.list'
-            with open(dist_file, 'w') as fout :
-                for d in dist :
-                    fout.write('{0}\n'.format('\t'.join(['{0:.5f}'.format(dd) for dd in (d+(1.-0.000005)) ])))
-            del dist, d
-            mstree = Popen([params['edmonds_' + platform.system()], dist_file], stdout=PIPE).communicate()[0]
-            os.unlink(dist_file)
+        try:
+## adp ###########
+# print dist
+
+##################             
+            wdist = np.round(dist, 0) + weight.reshape([weight.size, -1])
+#            np.fill_diagonal(wdist, 0.0)
+#            import json
+#            js=json.dumps( dist.__dict__ )
+#            print(json.dumps(js, indent=4))
+
+#            a_file = open("/tmp/test.txt", "w")
+#            for row in wdist:
+#                np.savetxt(a_file, row)
+#
+#            a_file.close()
+            #exit
+            del dist
+            import gc
+            gc.collect()            
+
+            presence = np.arange(weight.shape[0])
+            shortcuts = get_shortcut(wdist, weight)
+            for (s, t, d) in shortcuts :
+                wdist[s, wdist[s] > wdist[t]] = wdist[t, wdist[s] > wdist[t]]
+            presence[shortcuts.T[1]] = -1
+            wdist = wdist.T[presence >= 0].T[presence >= 0]
+            presence = presence[presence >=0]
+
+            wdist_file = params['tempfix'] + '.wdist.list'
+            with open(wdist_file, 'w') as fout :
+                for d in wdist :
+                    fout.write('{0}\n'.format('\t'.join([str(dd) for dd in (d+1.)])))
+            del wdist, d
+            mstree = Popen([params['edmonds_' + platform.system()], wdist_file], stdout=PIPE).communicate()[0]
+            os.unlink(wdist_file)
             if isinstance(mstree, bytes) :
                 mstree = mstree.decode('utf8')
             mstree = np.array([ br.strip().split() for br in mstree.strip().split('\n')], dtype=float).astype(int)
@@ -323,22 +297,33 @@ class methods(object) :
             return mstree.tolist() + shortcuts.tolist()
         except :
             try :
-                os.unlink(dist_file)
+                os.unlink(wdist_file)
             except :
                 pass
             dist = np.load(params['dist_file'])
-            dist = np.round(dist, 0) + weight.reshape([weight.size, -1])
-            np.fill_diagonal(dist, 0.0)
+            wdist = np.round(dist, 0) + weight.reshape([weight.size, -1])
+            np.fill_diagonal(wdist, 0.0)
+            #
+#            print (dist)
+#            import json
+#            js=json.load( dist )
+#            print(json.dumps(js, indent=4))                        
+#            exit
+            #
+            del dist
 
             presence = np.arange(weight.shape[0])
-            shortcuts = get_shortcut(dist, weight)
+            shortcuts = get_shortcut(wdist, weight)
+            #
+            print (wdist)
+            #
             for (s, t, d) in shortcuts :
-                dist[s, dist[s] > dist[t]] = dist[t, dist[s] > dist[t]]
+                wdist[s, wdist[s] > wdist[t]] = wdist[t, wdist[s] > wdist[t]]
                 presence[t] = -1
-            dist = dist.T[presence >= 0].T[presence >= 0]
+            wdist = wdist.T[presence >= 0].T[presence >= 0]
             presence = presence[presence >=0]
 
-            g = nx.DiGraph(dist)
+            g = nx.DiGraph(wdist)
             ms = nx.minimum_spanning_arborescence(g)
             return [[presence[d[0]], presence[d[1]], int(d[2]['weight'])] for d in ms.edges(data=True)] + shortcuts.tolist()
 
@@ -430,37 +415,44 @@ class methods(object) :
                     remain.append(br)
             branches = remain
 
-        tre = Tree()
-        nodeFinder = {}
-
-        tre.name = branch[0][0]
-        nodeFinder[tre.name] = tre
+        tre = dp.Tree()
+        node = tre.seed_node
+        node.taxon = tre.taxon_namespace.new_taxon(label=branch[0][0])
         for src, tgt, dif in branch :
-            node = nodeFinder[src]
-            child = node.add_child(name=tgt, dist=dif)
-            nodeFinder[child.name] = child
-        for node in tre.traverse('postorder') :
-            if not node.is_leaf() :
-                name = node.name
-                node.name = ''
-                node.add_child(name=names[name], dist=0.)
-            else :
-                node.name = names[node.name]
+            node = tre.find_node_with_taxon_label(src)
+            n = dp.Node(taxon=node.taxon)
+            node.add_child(n)
+            n.edge_length = 0.0
+            node.__dict__['taxon'] = None
+
+            n = dp.Node(taxon=tre.taxon_namespace.new_taxon(label=tgt))
+            node.add_child(n)
+            n.edge_length = dif
+        for taxon in tre.taxon_namespace :
+            taxon.label = names[taxon.label]
         return tre
 
 
     @staticmethod
     def MSTree(names, profiles, embeded, matrix_type='asymmetric', heuristic='harmonic', branch_recraft=True, handle_missing='pair_delete', **params) :
+        print("ADP:MSTree")
         n_loci = profiles.shape[1]
+        print("ADP:n_loci")
+        print(n_loci)
+        print("ADP:dist")
         dist = distance_matrix.get_distance(matrix_type, profiles, handle_missing)
+        print("ADP:weight")
         weight = eval('distance_matrix.'+heuristic)(dist, [len(embeded[n]) for n in names])
 
+        print("ADP:tree")
         tree = eval('methods._'+matrix_type)(dist, weight, **params)
-        del dist
         if branch_recraft :
+            print("ADP:tree branch_recraft")
             tree = methods._branch_recraft(tree, np.load(params['dist_file']), weight, n_loci)
-        if matrix_type != 'blockwise' :
-            tree = distance_matrix.symmetric_link(np.load(params['prof_file']), tree, handle_missing= handle_missing)
+            del dist
+        print("ADP:tree distance_matrix.symmetric_link")
+        tree = distance_matrix.symmetric_link(np.load(params['prof_file']), tree, handle_missing= handle_missing)
+        print("ADP:tree methods._network2tree")
         tree = methods._network2tree(tree, names)
         return tree
 
@@ -492,7 +484,7 @@ class methods(object) :
             indices.append(i)
         indices = np.array(indices)
         d = distance_matrix.get_distance(matrix_type, profiles, handle_missing)
-        if handle_missing != 'absolute_distance' and matrix_type != 'blockwise' :
+        if handle_missing != 'absolute_distance' :
             d /= profiles.shape[1]
 
         dist = np.zeros([len(names), len(names)])
@@ -520,18 +512,17 @@ class methods(object) :
                 Popen([params['NJ_Linux32'], '-i', dist_file, '-m', 'N'], stdout=PIPE).communicate()
             else :
                 raise e
-        tree = Tree(dist_file + '_fastme_tree.nwk')
-        for fname in glob(dist_file + '*') :
-            os.unlink(fname)
-
-        try:
-            tree.set_outgroup(tree.get_midpoint_outgroup())
-            tree.unroot()
+        tree = dp.Tree.get_from_path(dist_file + '_fastme_tree.nwk', schema='newick')
+        try :
+            tree.reroot_at_midpoint()
         except :
             pass
-
-        for leaf in tree.get_leaves() :
-            leaf.name = names[int(leaf.name.strip("'"))]
+        tree.is_rooted = False
+        from glob import glob
+        for fname in glob(dist_file + '*') :
+            os.unlink(fname)
+        for taxon in tree.taxon_namespace :
+            taxon.label = names[int(taxon.label)]
         return tree
     @staticmethod
     def NJ(names, profiles, embeded, handle_missing='pair_delete', **params) :
@@ -550,18 +541,13 @@ class methods(object) :
                 Popen([params['NJ_Linux32'], '-i', dist_file, '-m', 'N'], stdout=PIPE).communicate()
             else :
                 raise e
-        tree = Tree(dist_file + '_fastme_tree.nwk')
+        tree = dp.Tree.get_from_path(dist_file + '_fastme_tree.nwk', schema='newick')
+        tree.is_rooted = False
+        from glob import glob
         for fname in glob(dist_file + '*') :
             os.unlink(fname)
-
-        try:
-            tree.set_outgroup(tree.get_midpoint_outgroup())
-            tree.unroot()
-        except :
-            pass
-
-        for leaf in tree.get_leaves() :
-            leaf.name = names[int(leaf.name.strip("'"))]
+        for taxon in tree.taxon_namespace :
+            taxon.label = names[int(taxon.label)]
         return tree
     @staticmethod
     def RapidNJ(names, profiles, embeded, handle_missing='pair_delete', **params) :
@@ -573,19 +559,14 @@ class methods(object) :
             for n, d in enumerate(dist) :
                 fout.write( '{0!s:10} {1}\n'.format(n, ' '.join(['{:.6f}'.format(dd) for dd in d])) )
         del dist, d
-        Popen([params['RapidNJ_{0}'.format(platform.system())], '-n', '-x', dist_file+'_rapidnj.nwk', '-i', 'pd', dist_file], stdout=PIPE, stderr=PIPE).communicate()
-        tree = Tree(dist_file + '_rapidnj.nwk')
+        Popen([params['RapidNJ_{0}'.format(platform.system())], '-x', dist_file+'_rapidnj.nwk', '-i', 'pd', dist_file], stdout=PIPE, stderr=PIPE).communicate()
+        tree = dp.Tree.get_from_path(dist_file + '_rapidnj.nwk', schema='newick')
+        tree.is_rooted = False
+        from glob import glob
         for fname in glob(dist_file + '*') :
             os.unlink(fname)
-
-        try:
-            tree.set_outgroup(tree.get_midpoint_outgroup())
-            tree.unroot()
-        except :
-            pass
-
-        for leaf in tree.get_leaves() :
-            leaf.name = names[int(leaf.name.strip("'"))]
+        for taxon in tree.taxon_namespace :
+            taxon.label = names[int(taxon.label)]
         return tree
     @staticmethod
     def ninja(names, profiles, embeded, handle_missing='pair_delete', **params) :
@@ -598,26 +579,17 @@ class methods(object) :
                 fout.write( '{0!s:10} {1}\n'.format(n, ' '.join(['{:.6f}'.format(dd) for dd in d])) )
         del dist, d
         free_memory = int(0.9*psutil.virtual_memory().total/(1024.**2))
-        ninja_out = Popen(['java', '-d64', '-Xmx'+str(free_memory)+'M', '-jar', params['ninja_{0}'.format(platform.system())], '--in_type', 'd', dist_file], stdout=PIPE, stderr=PIPE, universal_newlines=True).communicate()
-        if ninja_out[1].find('64-bit JVM') >= 0 :
-            ninja_out = Popen(['java', '-Xmx1200M', '-jar', params['ninja_{0}'.format(platform.system())], '--in_type', 'd', dist_file], stdout=PIPE, stderr=PIPE, universal_newlines=True).communicate()
-        with open(dist_file + '.nwk', 'wt') as fout :
-            fout.write(ninja_out[0])
-        tree = Tree(dist_file + '.nwk')
+        ninja_out = Popen(['java', '-server', '-Xmx'+str(free_memory)+'M', '-jar', params['ninja_{0}'.format(platform.system())], '--in_type', 'd', dist_file], stdout=PIPE, stderr=PIPE).communicate()
+        tree = dp.Tree.get_from_string(ninja_out[0], schema='newick')
+        for edge in tree.edges() :
+            if edge.length :
+                edge.length *= profiles.shape[1]
+        tree.is_rooted = False
+        from glob import glob
         for fname in glob(dist_file + '*') :
             os.unlink(fname)
-
-        for node in tree.traverse() :
-            node.dist *= profiles.shape[1]
-
-        try:
-            tree.set_outgroup(tree.get_midpoint_outgroup())
-            tree.unroot()
-        except :
-            pass
-
-        for leaf in tree.get_leaves() :
-            leaf.name = names[int(leaf.name.strip("'"))]
+        for taxon in tree.taxon_namespace :
+            taxon.label = names[int(taxon.label)]
         return tree
 
 def nonredundant(names, profiles) :
@@ -669,8 +641,8 @@ def backend(**args) :
         To run a NJ tree (using FastME 2.0) :
         backend(profile=<filename>, method='NJ')
 
-        To run a RapidNJ tree :
-        backend(profile=<filename>, method='RapidNJ')
+        To run a fast NJ tree (using ninja [needs java]) :
+        backend(profile=<filename>, method='ninja')
 
         To obtain a standard distance matrix :
         backend(profile=<filename>, method='distance')
@@ -678,39 +650,27 @@ def backend(**args) :
     global params
     params.update(args)
     if params['method'] == 'MSTreeV2' :
-        params['method'] = 'MSTree'
-        params['matrix_type'] = 'asymmetric'
-        params['heuristic'] = 'harmonic'
-        params['branch_recraft'] = True
-
+        params.update(dict(
+            method = 'MSTree',
+            matrix_type = 'asymmetric',
+            heuristic = 'harmonic',
+            branch_recraft = True,
+        ))
     if params['wgMLST'] and params['matrix_type'] == 'asymmetric' :
         matrix_type = 'asymmetric_wgMLST'
 
 
     names, profiles = [], []
-    try :
-        if params['profile'][-3:].lower().endswith('.gz') :
-            fin = gzip.open(params['profile'], 'rt').readlines() if os.path.isfile(params['profile']) else params['profile'].split('\n')
-        else :
-            fin = open(params['profile']).readlines() if os.path.isfile(params['profile']) else params['profile'].split('\n')
-    except :
-        fin = params['profile'].split('\n')
+    fin = open(params['profile']).readlines() if os.path.isfile(params['profile']) else params['profile'].split('\n')
 
     allele_cols = None
     for line_id, line in enumerate(fin) :
         if line.startswith('#') :
             if not line.startswith('##') :
                 header = line.strip().split('\t')
-                allele_cols = np.array([ id for id, col in enumerate(header) if id > 0 and not col.startswith('#') and not col.lower() in {'st_id', 'st'} ])
+                allele_cols = np.array([ id for id, col in enumerate(header) if id > 0 and not col.startswith('#')])
             continue
-        if line.startswith('>') :
-            fmt = 'fasta'
-        else :
-            fmt = 'profile'
-            if allele_cols is None :
-                header = line.strip().split('\t')
-                allele_cols = np.array([ id for id, col in enumerate(header) if id > 0 and not col.startswith('#') and not col.lower() in {'st_id', 'st'} ])
-                line_id += 1
+        fmt = 'fasta' if line.startswith('>') else 'profile'
         break
 
     if fmt == 'fasta' :
@@ -722,6 +682,7 @@ def backend(**args) :
                 profiles[-1].extend(line.strip().split())
         for id, p in enumerate(profiles) :
             profiles[id] = list(''.join(p))
+#ADP: qui da profile -> matrix
     else :
         for line in fin[line_id:] :
             part = line.strip().split('\t')
@@ -732,8 +693,8 @@ def backend(**args) :
                 profiles.append(np.array(part)[allele_cols])
             else :
                 profiles.append(part[1:])
-    del fin, line, line_id, part, header
-    profiles = np.char.upper(np.array(profiles, dtype=str))
+#ADP: qui sono stringhe
+    profiles = np.char.upper(profiles)
     names = [re.sub(r'[\(\)\ \,\"\';]', '_', n) for n in names]
     names, profiles, embeded = nonredundant(np.array(names), np.array(profiles))
     if int(params.get('checkEnv', False)) :
@@ -748,28 +709,17 @@ def backend(**args) :
         params['dist_subfile'] = params['tempfix']+'.dist.{0}.npy'
         tre = eval('methods.' + params['method'])(names, profiles, embeded, **params)
         if params['method'] != 'distance' :
-            maxDist = 0.
-            for node in tre.iter_descendants() :
-                if node.dist > maxDist: maxDist = node.dist
-            if maxDist > 3 :
-                for node in tre.iter_descendants('postorder') :
-                    if node.dist < 0.1 and node.dist > 0 :
-                        for s in node.get_sisters() :
-                            s.dist += node.dist
-                        node.dist = 0
-            for leaf in tre.get_leaves() :
-                embeded_group = embeded[leaf.name]
+            for taxon in tre.taxon_namespace :
+                embeded_group = embeded[taxon.label]
                 if len(embeded_group) > 1 :
-                    leaf.name = ''
-                    for n in embeded_group :
-                        leaf.add_child(name=n, dist=0.)
+                    taxon.label = '({0}:0)'.format(':0,'.join(embeded_group))
 
             for fname in (params['prof_file'], params['dist_file']) :
                 try:
                     os.unlink(fname)
                 except :
                     pass
-            return tre.write(format=1).replace("'", "")
+            return tre.as_string('newick').replace("'", "")
         else :
             for fname in (params['prof_file'], params['dist_file']) :
                 try:
@@ -779,7 +729,7 @@ def backend(**args) :
             return '\n'.join(tre)
 
 def estimate_Consumption(platform, method, matrix, n_proc, n_loci, n_profile) :
-    if method in ('MSTree', 'RapidNJ', 'ninja') :
+    if method in ('MSTree', 'RapidNJ') :
         if matrix == 'asymmetric' :
             if platform == 'Windows' :
                 time = 5.600754e-6 * n_profile * n_profile + 6.22306e-9 * n_loci * n_profile * n_profile/n_proc + 22.71
@@ -806,5 +756,5 @@ def estimate_Consumption(platform, method, matrix, n_proc, n_loci, n_profile) :
 
 if __name__ == '__main__' :
     tre = backend(**add_args())
-    sys.stdout.write(tre+'\n')
+    print(tre)
 
